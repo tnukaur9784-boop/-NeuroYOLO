@@ -1,4 +1,8 @@
-"""Robust monocular gait analysis pipeline for clinical research."""
+"""Robust monocular gait analysis pipeline for clinical research.
+
+This module extracts pose trajectories with MediaPipe Pose and computes
+biomechanically grounded temporal and spatial gait metrics from one walking video.
+"""
 
 from __future__ import annotations
 
@@ -9,8 +13,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-
 import cv2
 import matplotlib.pyplot as plt
 import mediapipe as mp
@@ -20,6 +22,7 @@ from scipy.signal import butter, filtfilt, find_peaks, savgol_filter
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# MediaPipe pose landmark indices
 LEFT_HIP = 23
 RIGHT_HIP = 24
 LEFT_HEEL = 29
@@ -86,6 +89,14 @@ def _regularity_index(step_intervals: Sequence[float]) -> float:
     if np.std(x) < 1e-8 or np.std(y) < 1e-8:
         return 0.0
     r = np.corrcoef(x, y)[0, 1]
+    """Lag-1 autocorrelation (%), clipped to [0, 100]."""
+    x = np.asarray(step_intervals, dtype=float)
+    if x.size < 4:
+        return 0.0
+    a, b = x[:-1], x[1:]
+    if np.std(a) < 1e-8 or np.std(b) < 1e-8:
+        return 0.0
+    r = np.corrcoef(a, b)[0, 1]
     if np.isnan(r):
         return 0.0
     return float(np.clip(r, 0.0, 1.0) * 100.0)
@@ -104,6 +115,7 @@ class MarkerlessGaitAnalyzer:
         self.subject_height_m = subject_height_m
         self.config = config or GaitConfig()
         self.fps = 0.0
+        self.fps: float = 0.0
 
     def _extract_pose(self) -> pd.DataFrame:
         cap = cv2.VideoCapture(str(self.video_path))
@@ -123,6 +135,7 @@ class MarkerlessGaitAnalyzer:
         frame_idx = -1
         proc_idx = 0
         tracked = [
+        tracked_ids = [
             LEFT_HIP,
             RIGHT_HIP,
             LEFT_ANKLE,
@@ -147,6 +160,7 @@ class MarkerlessGaitAnalyzer:
                 res = pose.process(rgb)
 
                 row = {
+                row: Dict[str, float] = {
                     "frame": frame_idx,
                     "t": proc_idx / (self.fps / self.config.frame_skip),
                     "w": w,
@@ -162,6 +176,17 @@ class MarkerlessGaitAnalyzer:
                         row[f"x_{i}"] = lm.x * w
                         row[f"y_{i}"] = lm.y * h
 
+                for i in tracked_ids:
+                    row[f"x_{i}"] = np.nan
+                    row[f"y_{i}"] = np.nan
+                    row[f"v_{i}"] = 0.0
+
+                if res.pose_landmarks:
+                    for i in tracked_ids:
+                        lm = res.pose_landmarks.landmark[i]
+                        row[f"x_{i}"] = lm.x * w
+                        row[f"y_{i}"] = lm.y * h
+                        row[f"v_{i}"] = lm.visibility
                 rows.append(row)
                 proc_idx += 1
         finally:
@@ -170,6 +195,7 @@ class MarkerlessGaitAnalyzer:
 
         if not rows:
             raise RuntimeError("No frames could be processed.")
+            raise RuntimeError("No usable frames found in video.")
 
         df = pd.DataFrame(rows)
         for col in df.columns:
@@ -196,6 +222,7 @@ class MarkerlessGaitAnalyzer:
     def _derive_scale(self, df: pd.DataFrame) -> float:
         if self.scale_m_per_px is not None and self.scale_m_per_px > 0:
             return float(self.scale_m_per_px)
+
         if self.subject_height_m is None:
             raise ValueError("Provide --scale_m_per_px or --subject_height_m.")
 
@@ -235,6 +262,48 @@ class MarkerlessGaitAnalyzer:
         rel_l = l_heel_prog - pelvis_prog
         rel_r = r_heel_prog - pelvis_prog
 
+            raise ValueError("Failed to estimate pixel scale from body segments.")
+
+        # Approximate hip->ankle anthropometric ratio to height.
+        leg_m = 0.53 * self.subject_height_m
+        return float(leg_m / leg_px)
+
+    def _build_axes_and_signals(self, df: pd.DataFrame) -> Dict[str, np.ndarray]:
+        """Build pelvis-centered progression/lateral coordinates using PCA axis."""
+        fs = self.fps / self.config.frame_skip
+
+        hip_x = 0.5 * (df[f"x_{LEFT_HIP}"].to_numpy() + df[f"x_{RIGHT_HIP}"].to_numpy())
+        hip_y = 0.5 * (df[f"y_{LEFT_HIP}"].to_numpy() + df[f"y_{RIGHT_HIP}"].to_numpy())
+
+        l_heel = np.column_stack([df[f"x_{LEFT_HEEL}"].to_numpy(), df[f"y_{LEFT_HEEL}"].to_numpy()])
+        r_heel = np.column_stack([df[f"x_{RIGHT_HEEL}"].to_numpy(), df[f"y_{RIGHT_HEEL}"].to_numpy()])
+        pelvis = np.column_stack([hip_x, hip_y])
+
+        heel_stack = np.vstack([l_heel - pelvis, r_heel - pelvis])
+        heel_stack -= np.nanmean(heel_stack, axis=0, keepdims=True)
+        u, s, vt = np.linalg.svd(heel_stack, full_matrices=False)
+        prog_axis = vt[0]
+        lat_axis = vt[1]
+
+        # Global progression sign from pelvis displacement.
+        pelvis_disp = pelvis[-1] - pelvis[0]
+        if np.dot(pelvis_disp, prog_axis) < 0:
+            prog_axis = -prog_axis
+
+        l_heel_prog = np.dot(l_heel, prog_axis)
+        r_heel_prog = np.dot(r_heel, prog_axis)
+        pelvis_prog = np.dot(pelvis, prog_axis)
+
+        l_heel_lat = np.dot(l_heel, lat_axis)
+        r_heel_lat = np.dot(r_heel, lat_axis)
+
+        # Foot progression relative pelvis: robust for side/frontal/oblique views.
+        rel_l = l_heel_prog - pelvis_prog
+        rel_r = r_heel_prog - pelvis_prog
+
+        l_ank_y = df[f"y_{LEFT_ANKLE}"].to_numpy()
+        r_ank_y = df[f"y_{RIGHT_ANKLE}"].to_numpy()
+
         sig = {
             "t": df["t"].to_numpy(),
             "pelvis_prog": self._smooth(pelvis_prog, fs),
@@ -257,6 +326,21 @@ class MarkerlessGaitAnalyzer:
         l_hs, _ = find_peaks(-gap, distance=min_step_dist, prominence=prominence)
 
         return np.sort(l_hs.astype(int)), np.sort(r_hs.astype(int))
+
+            "l_heel_lat": self._smooth(l_heel_lat, fs),
+            "r_heel_lat": self._smooth(r_heel_lat, fs),
+            "rel_l": self._smooth(rel_l, fs),
+            "rel_r": self._smooth(rel_r, fs),
+            "ankle_y_l": self._smooth(l_ank_y, fs),
+            "ankle_y_r": self._smooth(r_ank_y, fs),
+        }
+
+        sig["v_rel_l"] = np.gradient(sig["rel_l"], 1.0 / fs)
+        sig["v_rel_r"] = np.gradient(sig["rel_r"], 1.0 / fs)
+        sig["v_ankle_y_l"] = np.gradient(sig["ankle_y_l"], 1.0 / fs)
+        sig["v_ankle_y_r"] = np.gradient(sig["ankle_y_r"], 1.0 / fs)
+        sig["heel_gap_prog"] = sig["r_heel_prog"] - sig["l_heel_prog"]
+        return sig
 
     def _filter_stride_intervals(self, hs: np.ndarray, fs: float) -> np.ndarray:
         if hs.size < 2:
@@ -311,12 +395,42 @@ class MarkerlessGaitAnalyzer:
 
         l_to = self._detect_to_between_hs(l_hs, sig["rel_l"])
         r_to = self._detect_to_between_hs(r_hs, sig["rel_r"])
+    def _detect_hs_from_relative_position(self, rel_sig: np.ndarray, fs: float) -> np.ndarray:
+        min_dist = max(1, int(self.config.min_stride_time_s * fs * 0.7))
+        prominence = max(0.15 * np.std(rel_sig), 1.0)
+        peaks, _ = find_peaks(rel_sig, distance=min_dist, prominence=prominence)
+        return self._filter_stride_intervals(peaks.astype(int), fs)
+
+    def _detect_to_from_hs(self, hs: np.ndarray, rel_sig: np.ndarray) -> np.ndarray:
+        """Toe-off = local minimum in relative foot progression between HS(i) and HS(i+1)."""
+        if hs.size < 2:
+            return np.array([], dtype=int)
+        tos: List[int] = []
+        for a, b in zip(hs[:-1], hs[1:]):
+            if b <= a + 2:
+                continue
+            seg = rel_sig[a:b]
+            if seg.size < 3:
+                continue
+            k = int(np.argmin(seg))
+            idx = a + k
+            if a < idx < b:
+                tos.append(idx)
+        return np.asarray(tos, dtype=int)
+
+    def _events(self, sig: Dict[str, np.ndarray]) -> Dict[str, EventSeries]:
+        fs = self.fps / self.config.frame_skip
+        l_hs = self._detect_hs_from_relative_position(sig["rel_l"], fs)
+        r_hs = self._detect_hs_from_relative_position(sig["rel_r"], fs)
+        l_to = self._detect_to_from_hs(l_hs, sig["rel_l"])
+        r_to = self._detect_to_from_hs(r_hs, sig["rel_r"])
         return {
             "left": EventSeries(l_hs, l_to),
             "right": EventSeries(r_hs, r_to),
         }
 
     def _temporal(self, events: Dict[str, EventSeries], fs: float) -> Dict[str, List[float]]:
+    def _temporal(self, events: Dict[str, EventSeries], fs: float) -> Dict[str, List[float] | float]:
         l_hs = events["left"].heel_strike_idx
         r_hs = events["right"].heel_strike_idx
         l_to = events["left"].toe_off_idx
@@ -329,6 +443,8 @@ class MarkerlessGaitAnalyzer:
         step_times: List[float] = []
         step_l: List[float] = []
         step_r: List[float] = []
+        step_times_l: List[float] = []
+        step_times_r: List[float] = []
         for (i0, s0), (i1, s1) in zip(merged[:-1], merged[1:]):
             if s0 == s1:
                 continue
@@ -378,6 +494,49 @@ class MarkerlessGaitAnalyzer:
             "stride_times_right": r_stride.tolist(),
             "stance_times": stance_l + stance_r,
             "swing_times": swing_l + swing_r,
+                    step_times_l.append(dt)
+                else:
+                    step_times_r.append(dt)
+
+        l_stance, l_swing = [], []
+        for hs, to in zip(l_hs[:-1], l_to):
+            if hs < to:
+                l_stance.append((to - hs) / fs)
+        for to, hs_next in zip(l_to, l_hs[1:]):
+            if to < hs_next:
+                l_swing.append((hs_next - to) / fs)
+
+        r_stance, r_swing = [], []
+        for hs, to in zip(r_hs[:-1], r_to):
+            if hs < to:
+                r_stance.append((to - hs) / fs)
+        for to, hs_next in zip(r_to, r_hs[1:]):
+            if to < hs_next:
+                r_swing.append((hs_next - to) / fs)
+
+        ds: List[float] = []
+        # First DS: ipsilateral HS until contralateral TO.
+        for hs_l in l_hs:
+            next_r_to = r_to[r_to > hs_l]
+            if next_r_to.size:
+                d = (next_r_to[0] - hs_l) / fs
+                if 0 < d < 0.8:
+                    ds.append(d)
+        for hs_r in r_hs:
+            next_l_to = l_to[l_to > hs_r]
+            if next_l_to.size:
+                d = (next_l_to[0] - hs_r) / fs
+                if 0 < d < 0.8:
+                    ds.append(d)
+
+        return {
+            "step_times": step_times,
+            "step_times_left": step_times_l,
+            "step_times_right": step_times_r,
+            "stride_times_left": l_stride.tolist(),
+            "stride_times_right": r_stride.tolist(),
+            "stance_times": l_stance + r_stance,
+            "swing_times": l_swing + r_swing,
             "cycle_times": np.concatenate([l_stride, r_stride]).tolist() if (l_stride.size + r_stride.size) else [],
             "double_support": ds,
         }
@@ -411,6 +570,48 @@ class MarkerlessGaitAnalyzer:
             "stride_lengths": stride_lengths,
             "mean_step_length": _safe_mean(step_lengths),
             "mean_stride_length": _safe_mean(stride_lengths),
+    def _spatial(
+        self,
+        events: Dict[str, EventSeries],
+        sig: Dict[str, np.ndarray],
+        scale_m_per_px: float,
+    ) -> Dict[str, List[float] | float]:
+        l_hs = events["left"].heel_strike_idx
+        r_hs = events["right"].heel_strike_idx
+
+        merged = sorted([(i, "L") for i in l_hs] + [(i, "R") for i in r_hs], key=lambda x: x[0])
+
+        step_lens, step_lens_l, step_lens_r = [], [], []
+        for idx, side in merged:
+            d_px = abs(sig["r_heel_prog"][idx] - sig["l_heel_prog"][idx])
+            d_m = d_px * scale_m_per_px
+            if 0.05 <= d_m <= 2.0:
+                step_lens.append(d_m)
+                if side == "L":
+                    step_lens_l.append(d_m)
+                else:
+                    step_lens_r.append(d_m)
+
+        # Stride length from pelvis progression between same-side successive HS.
+        stride_l, stride_r = [], []
+        for a, b in zip(l_hs[:-1], l_hs[1:]):
+            d = (sig["pelvis_prog"][b] - sig["pelvis_prog"][a]) * scale_m_per_px
+            if 0.1 <= d <= 3.5:
+                stride_l.append(float(d))
+        for a, b in zip(r_hs[:-1], r_hs[1:]):
+            d = (sig["pelvis_prog"][b] - sig["pelvis_prog"][a]) * scale_m_per_px
+            if 0.1 <= d <= 3.5:
+                stride_r.append(float(d))
+
+        return {
+            "step_lengths": step_lens,
+            "step_lengths_left": step_lens_l,
+            "step_lengths_right": step_lens_r,
+            "stride_lengths_left": stride_l,
+            "stride_lengths_right": stride_r,
+            "mean_step_length": _safe_mean(step_lens),
+            "mean_stride_length": _safe_mean(stride_l + stride_r),
+            "net_distance_m": float((sig["pelvis_prog"][-1] - sig["pelvis_prog"][0]) * scale_m_per_px),
         }
 
     def analyze(self) -> AnalysisOutput:
@@ -418,6 +619,7 @@ class MarkerlessGaitAnalyzer:
         fs = self.fps / self.config.frame_skip
         scale = self._derive_scale(df)
         sig = self._build_signals(df)
+        sig = self._build_axes_and_signals(df)
         events = self._events(sig)
 
         temporal = self._temporal(events, fs)
@@ -431,10 +633,22 @@ class MarkerlessGaitAnalyzer:
         cycle_time = _safe_mean(temporal["cycle_times"])
         ds_time = _safe_mean(temporal["double_support"])
         ds_ratio = (ds_time / cycle_time * 100.0) if cycle_time > 0 else 0.0
+        speed = spatial["net_distance_m"] / duration if duration > 0 else 0.0
+
+        step_cv_r = _safe_cv(temporal["step_times_right"])
+        step_cv_l = _safe_cv(temporal["step_times_left"])
+        stride_cv_r = _safe_cv(temporal["stride_times_right"])
+        stride_cv_l = _safe_cv(temporal["stride_times_left"])
+        cadence_var = _safe_cv(temporal["step_times"])
 
         mean_step_r = _safe_mean(spatial["step_lengths_right"])
         mean_step_l = _safe_mean(spatial["step_lengths_left"])
         step_asym = abs(mean_step_r - mean_step_l) / max((mean_step_r + mean_step_l) / 2.0, 1e-6) * 100.0
+
+        cycle_time = _safe_mean(temporal["cycle_times"])
+        ds_time = _safe_mean(temporal["double_support"])
+        ds_ratio = ds_time / cycle_time * 100.0 if cycle_time > 0 else 0.0
+        reg_idx = _regularity_index(temporal["step_times"])
 
         metrics = {
             "Duration (s)": duration,
@@ -455,6 +669,13 @@ class MarkerlessGaitAnalyzer:
             "Cadence Variability (%)": _safe_cv(temporal["step_times"]),
             "Step Asymmetry (%)": step_asym,
             "Regularity Index (%)": _regularity_index(temporal["step_times"]),
+            "Step Time Coefficient of Variation Right (%)": step_cv_r,
+            "Step Time Coefficient of Variation Left (%)": step_cv_l,
+            "Stride Time Coefficient of Variation Right (%)": stride_cv_r,
+            "Stride Time Coefficient of Variation Left (%)": stride_cv_l,
+            "Cadence Variability (%)": cadence_var,
+            "Step Asymmetry (%)": step_asym,
+            "Regularity Index (%)": reg_idx,
         }
 
         diagnostics = {
@@ -462,6 +683,8 @@ class MarkerlessGaitAnalyzer:
             "ankle_vertical_left": sig["ankle_y_l"],
             "ankle_vertical_right": sig["ankle_y_r"],
             "heel_gap_progression": sig["heel_gap_prog"],
+            "rel_prog_left": sig["rel_l"],
+            "rel_prog_right": sig["rel_r"],
             "step_intervals": np.asarray(temporal["step_times"], dtype=float),
         }
         return AnalysisOutput(metrics=metrics, frame_table=df, events=events, diagnostics=diagnostics)
@@ -471,6 +694,9 @@ def print_results_table(metrics: Dict[str, float]) -> None:
     df = pd.DataFrame({"Metric": list(metrics.keys()), "Value": list(metrics.values())})
     print("\n===== Gait Analysis Results =====")
     print(df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    table = pd.DataFrame({"Metric": list(metrics.keys()), "Value": list(metrics.values())})
+    print("\n===== Gait Analysis Results =====")
+    print(table.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
 
 
 def save_results_csv(metrics: Dict[str, float], out_csv: Path) -> None:
@@ -494,6 +720,22 @@ def save_diagnostic_plots(out: AnalysisOutput, out_png: Path, fs: float) -> None
     axs[0].plot(t, ay_l, label="Left ankle Y", color="tab:blue")
     axs[0].plot(t, ay_r, label="Right ankle Y", color="tab:orange")
     axs[0].set_title("Ankle Vertical Displacement")
+    a_l = out.diagnostics["ankle_vertical_left"]
+    a_r = out.diagnostics["ankle_vertical_right"]
+    rel_l = out.diagnostics["rel_prog_left"]
+    rel_r = out.diagnostics["rel_prog_right"]
+    step_intervals = out.diagnostics["step_intervals"]
+
+    l_hs = out.events["left"].heel_strike_idx / fs
+    r_hs = out.events["right"].heel_strike_idx / fs
+    l_to = out.events["left"].toe_off_idx / fs
+    r_to = out.events["right"].toe_off_idx / fs
+
+    fig, axs = plt.subplots(3, 1, figsize=(12, 12), constrained_layout=True)
+
+    axs[0].plot(t, a_l, label="Left ankle Y", color="tab:blue")
+    axs[0].plot(t, a_r, label="Right ankle Y", color="tab:orange")
+    axs[0].set_title("Ankle Vertical Displacement (smoothed)")
     axs[0].set_xlabel("Time (s)")
     axs[0].set_ylabel("Pixels")
     axs[0].grid(alpha=0.3)
@@ -509,6 +751,17 @@ def save_diagnostic_plots(out: AnalysisOutput, out_png: Path, fs: float) -> None
     axs[1].set_title("Detected Gait Events")
     axs[1].set_xlabel("Time (s)")
     axs[1].set_ylabel("Signal")
+    axs[1].plot(t, rel_l, color="tab:blue", label="Left foot rel progression")
+    axs[1].plot(t, rel_r, color="tab:orange", label="Right foot rel progression")
+    for x in l_hs:
+        axs[1].axvline(x, color="tab:blue", linestyle="--", alpha=0.25)
+    for x in r_hs:
+        axs[1].axvline(x, color="tab:orange", linestyle="--", alpha=0.25)
+    axs[1].scatter(l_to, np.interp(l_to, t, rel_l), marker="x", color="tab:blue", s=40, label="L toe-off")
+    axs[1].scatter(r_to, np.interp(r_to, t, rel_r), marker="x", color="tab:orange", s=40, label="R toe-off")
+    axs[1].set_title("Detected Gait Events (HS lines, TO markers)")
+    axs[1].set_xlabel("Time (s)")
+    axs[1].set_ylabel("Relative progression (px)")
     axs[1].grid(alpha=0.3)
     axs[1].legend(loc="best")
 
@@ -532,6 +785,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scale_m_per_px", type=float, default=None, help="Known spatial scale")
     p.add_argument("--subject_height_m", type=float, default=None, help="Subject height for auto-scale")
     p.add_argument("--frame_skip", type=int, default=1, help="Process every Nth frame")
+    p.add_argument("--out_csv", default="gait_metrics.csv", help="Output CSV file")
+    p.add_argument("--out_plot", default="gait_diagnostics.png", help="Output diagnostics plot")
+    p.add_argument("--scale_m_per_px", type=float, default=None, help="Known meters-per-pixel scale")
+    p.add_argument("--subject_height_m", type=float, default=None, help="Subject height (m), used for auto scale")
+    p.add_argument("--frame_skip", type=int, default=1, help="Process every N-th frame")
     p.add_argument("--smoothing", choices=["savgol", "butter"], default="savgol")
     return p.parse_args()
 
