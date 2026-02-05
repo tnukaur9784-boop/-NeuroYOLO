@@ -26,6 +26,7 @@ print("Uploaded:", video_name)
 ## 3) Add the analyzer script
 
 ### Option A (recommended): Upload `gait_pipeline.py` (or the compatibility file `gait_analysis_pipeline.py`)
+### Option A (recommended): Upload `gait_pipeline.py`
 
 ```python
 uploaded = files.upload()  # choose gait_pipeline.py from your computer
