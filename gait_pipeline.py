@@ -1,3 +1,4 @@
+"""Robust monocular gait analysis pipeline for clinical research."""
 """Robust monocular gait analysis pipeline for clinical research.
 
 This module extracts pose trajectories with MediaPipe Pose and computes
@@ -12,6 +13,8 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import cv2
 import matplotlib.pyplot as plt

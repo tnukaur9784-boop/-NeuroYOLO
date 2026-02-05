@@ -25,6 +25,7 @@ print("Uploaded:", video_name)
 
 ## 3) Add the analyzer script
 
+### Option A (recommended): Upload `gait_pipeline.py` (or the compatibility file `gait_analysis_pipeline.py`)
 ### Option A (recommended): Upload `gait_pipeline.py`
 
 ```python
@@ -48,6 +49,13 @@ Use either a known scale or subject height.
 
 ```python
 !python gait_pipeline.py \
+  --video "$video_name" \
+  --scale_m_per_px 0.0025 \
+  --out_csv gait_metrics.csv \
+  --out_plot gait_diagnostics.png
+
+# If your notebook uses older naming, this also works:
+!python gait_analysis_pipeline.py \
   --video "$video_name" \
   --scale_m_per_px 0.0025 \
   --out_csv gait_metrics.csv \
